@@ -1,6 +1,6 @@
 # RTSP Privacy Encoder
 
-This is just a small personal project I created for myself as the NVR I'm using lacks the feature but decided to share it as it seems to be a widespread problems for countries with GDRP regulation prohibiting monitoring of areas considered public places (i.e. pavements etc).
+This is just a small personal project I created for myself as the NVR I'm using lacks the feature but decided to share it as it seems to be a widespread problem for countries with GDRP regulation prohibiting monitoring of areas considered public places (i.e. pavements etc).
 
 The system puts a **privacy mask** over RTSP camera streams and re-encodes them to H.264 — GPU-accelerated with AMD/Intel VAAPI or NVIDIA NVENC. A browser-based editor lets you draw and edit masks over a live camera frame without touching the server.
 
@@ -10,7 +10,7 @@ Example performance during my testing with 3 streams at 2560x1440 and 1 stream a
 
 Intel N100 mini PC:  around 40-50% CPU with a load average around 2
 
-When tested were conducted on more capable systems the load was so small it was undesirable. 
+When tested were conducted on more capable systems the load was so small it was indistinguishable. 
 If figures are way off, take a look so that the hardware offload is working on the system and it's not using CPU to encode/decode.
 
 As the encoder needs a sink to push to - the excellent MediaMTX docker (https://github.com/bluenviron/mediamtx) is in the compose file but you may push to whatever RTSP sink you want/have.
