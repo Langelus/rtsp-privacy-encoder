@@ -1,0 +1,75 @@
+# ============================================================================
+# RTSP privacy-mask encoder stack
+#
+#   cameras.yaml ──> [supervisor: N encoders + web UI] ──> rtsp-server ──> Frigate
+#
+# Quick start:
+#   1. cp cameras.yaml.example cameras.yaml
+#   2. Edit cameras.yaml — fill in real camera source_url values with credentials
+#   3. docker compose build
+#   4. docker compose up -d
+#
+# All camera credentials live in cameras.yaml (host-mounted read-only).
+# Edit cameras.yaml at any time — the supervisor hot-reloads it within 5s.
+# No rebuild or compose edit needed to add/remove cameras.
+# ============================================================================
+
+services:
+  # ──────────────────────────────────────────────────────── RTSP relay ──────
+  # Encoders push here; Frigate (or any other consumer) pulls from :8554.
+  # Same MediaMTX engine the legacy standalone box used, default config.
+  rtsp-server:
+    image: bluenviron/mediamtx
+    container_name: rtsp-enc-sink
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${RTSP_PORT:-8554}:8554"
+    environment:
+      MTX_RTSPTRANSPORTS: tcp   # only port 8554 is exposed; UDP RTP would need a large port range
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ──────────────────────────────────────────────────── encoder + web UI ──
+  # supervisor.py reads cameras.yaml and keeps one entrypoint.sh subprocess
+  # per camera (backoff, watchdog, D-state recovery — same as before but
+  # managed in-process instead of by Docker).  No Docker socket needed.
+  rtsp-encoder:
+    image: rtsp-privacy-encoder:local
+    build:
+      context: .
+      dockerfile: Dockerfile            # use Dockerfile.nvidia for NVIDIA NVENC
+    container_name: rtsp-encoder
+    restart: unless-stopped
+    init: true                              # tini as PID 1: reaps D-state ffmpeg orphans
+    depends_on: [rtsp-server]
+    # VAAPI (AMD iGPU / Intel QuickSync): pass the DRI render node.
+    # For NVIDIA NVENC: remove the 'devices' block, use Dockerfile.nvidia,
+    # and uncomment the 'deploy' block below.
+    devices:
+      - /dev/dri
+    # deploy:                               # NVIDIA NVENC alternative (requires NVIDIA Container Toolkit)
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    volumes:
+      - ./cameras.yaml:/config/cameras.yaml:ro  # credentials — never committed / never in this file
+      - ./overlays:/overlays                    # mask PNGs: editor writes, encoders read
+    ports:
+      - "${ADMIN_PORT:-8090}:8090"          # web UI + REST API
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}         # optional; if set, /api/* requires X-Admin-Token header
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,18 @@
+# Real camera credentials — use cameras.yaml.example as the template
+cameras.yaml
+
+# Overlay PNGs may contain geometric information about real sites
+overlays/*.png
+
+# Environment / secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~

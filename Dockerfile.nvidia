@@ -1,0 +1,40 @@
+# NVIDIA NVENC variant
+#
+# Base: jrottenberg/ffmpeg (CUDA/NVENC build, Ubuntu 22.04)
+# Adds:  Python 3 + supervisor.py (camera lifecycle + Flask web UI)
+#
+# Requirements on the host:
+#   - NVIDIA GPU
+#   - NVIDIA driver (≥ 520 recommended for H.264 NVENC)
+#   - NVIDIA Container Toolkit (nvidia-docker2 / nvidia-ctk)
+#
+# docker-compose.yml: replace the 'devices: /dev/dri' stanza with:
+#   deploy:
+#     resources:
+#       reservations:
+#         devices:
+#           - driver: nvidia
+#             count: 1
+#             capabilities: [gpu]
+#
+# cameras.yaml: encode: nvenc   hwaccel: auto   (or hwaccel: cuda to force CUDA decode)
+ARG FFMPEG_BASE=jrottenberg/ffmpeg:8-nvidia
+FROM ${FFMPEG_BASE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         python3 \
+         python3-pip \
+         python3-venv \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir flask pillow waitress pyyaml \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
+COPY supervisor.py /supervisor.py
+COPY web/static/ /app/static/
+
+VOLUME ["/config", "/overlays"]
+EXPOSE 8090
+
+ENTRYPOINT ["/opt/venv/bin/python3", "/supervisor.py"]

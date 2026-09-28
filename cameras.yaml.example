@@ -1,0 +1,119 @@
+# ============================================================================
+# RTSP Privacy Encoder — camera configuration
+#
+# Copy this file to cameras.yaml and fill in your real camera credentials.
+# The supervisor hot-reloads this file within 5 seconds of any change:
+#   - adding a camera entry starts it immediately
+#   - removing a camera entry stops it gracefully
+#   - changing encoder settings (fps, qp, etc.) takes effect on next restart
+#     (use "Save & Apply" in the web UI, or docker compose restart rtsp-encoder)
+#
+# Credentials live ONLY here
+# ============================================================================
+
+
+# ── Global / default settings ────────────────────────────────────────────────
+# Any of these can be overridden per camera in the cameras list below.
+
+# Where the encoders push their masked streams (the bundled mediamtx service).
+rtsp_server: "rtsp://rtsp-server:8554"
+
+# ── Encoder selection ────────────────────────────────────────────────────────
+encode: vaapi     # vaapi = GPU H.264 (AMD iGPU / Intel QuickSync)
+                  # nvenc = GPU H.264 (NVIDIA NVENC, requires Dockerfile.nvidia)
+                  # x264  = CPU software fallback
+
+# ── GPU decode ───────────────────────────────────────────────────────────────
+# With GPU decode the encoded frames never visit the CPU (big load reduction
+# for 4K/HEVC sources). auto tests the source at startup and falls back to
+# software decode if the GPU rejects the stream's profile/level.
+hwaccel: auto     # auto  = test at startup, fall back to CPU on failure
+                  # vaapi = force VAAPI decode (ENCODE=vaapi only)
+                  # cuda  = force CUDA decode  (ENCODE=nvenc only)
+                  # none  = always CPU decode
+
+# ── GPU overlay (overlay_vaapi) ──────────────────────────────────────────────
+# When GPU decode is active, the privacy mask can be composited on the GPU too.
+# auto runs a pixel-check at startup and falls back to CPU if colours are wrong
+# (observed on some Intel iHD drivers). CPU overlay is cheap on modern iGPUs.
+overlay_hwaccel: auto   # auto | vaapi (force) | off
+
+# ── VAAPI render node ────────────────────────────────────────────────────────
+vaapi_device: auto   # auto | renderD128 | renderD129 | /dev/dri/renderD128
+
+# ── Frame rate and keyframe interval ────────────────────────────────────────
+fps: auto    # auto = probe the camera's native rate at startup; or pin e.g. 15
+gop: auto    # auto = 4 × fps (clamped 30–120); pin e.g. 60 for a 4s GOP at 15fps
+
+# ── Quality / bitrate ────────────────────────────────────────────────────────
+qp: 28         # constant-QP quality (0 = lossless, 51 = worst); used when bitrate is empty
+bitrate:       # e.g. "2M" — switches encoder to VBR; leave empty for constant-QP
+maxrate:       # e.g. "3M" — VBR peak rate cap (VBR mode only)
+bufsize:       # e.g. "6M" — VBR rate-control buffer (VBR mode only)
+
+# ── H.264 encoder profile / level ───────────────────────────────────────────
+profile: main  # main | high | baseline
+level: auto    # auto = encoder picks the lowest level that fits; or pin e.g. "5.1"
+b_frames: 1    # B-frame count; 0 disables B-frames (useful for low-latency)
+
+# ── Audio ────────────────────────────────────────────────────────────────────
+audio_mode: aac    # aac = re-encode to AAC (fixes G.711 timestamp glitches)
+                   # copy = pass camera audio through unchanged
+                   # none = drop audio
+audio_bitrate: 64k # AAC target bitrate (aac mode only)
+
+# ── Optional downscale ───────────────────────────────────────────────────────
+# Scales the OUTPUT after mask compositing. The mask canvas is native-sized, so
+# this only reduces bandwidth/decode cost downstream — masks stay aligned.
+# NOTE: the masked stream is the legal archive copy — never downscale the main.
+# scale:          # e.g. "1920:1080" — leave empty (default) for native resolution
+
+# ── Sub stream (low-resolution masked copy for Frigate detect) ───────────────
+# A second, low-resolution output pushed alongside the main masked stream.
+# Same ffmpeg process — cameras allow only one main-stream session, so this
+# can't be a separate encoder. Video only (no audio for detectors).
+sub_scale: "640:-2"   # W:H; -2 = keep aspect ratio; "off" to disable entirely
+
+# ── Watchdog ─────────────────────────────────────────────────────────────────
+watchdog_interval: 20   # seconds between output-stream probes
+watchdog_fails: 3       # consecutive failed probes before force-kill
+
+# ── Preflight self-test ──────────────────────────────────────────────────────
+preflight: 1   # 1 = run a 1s test-encode at startup to catch driver issues early
+
+# ── Preventive restart ───────────────────────────────────────────────────────
+# AMD VAAPI iGPU drivers (radeonsi) can develop an uninterruptible kernel hang
+# (D-state) after many hours of continuous use if unlucky. The watchdog detects and
+# recovers from it, but a periodic preventive restart avoids the outage.
+# Recommended: 8–12 for AMD iGPU; 0 (off) for Intel iHD which is more stable.
+max_uptime_hours: 0   # 0 = off; set e.g. 8 for AMD iGPU (NVENC is more stable, 0 is fine)
+
+
+# ── Cameras ──────────────────────────────────────────────────────────────────
+# Required per camera: name, source_url
+# Optional per camera: overlay_file, output_url, sub_output_url, and any of the
+# global settings above to override them for just that camera.
+#
+# Examples, please susbstitute credentials and IPs:
+# 
+#  TP-Link: rtsp://USERNAME:PASSWORD@IP/stream1 			(use stream1 - low-res at "stream2")
+#  Dahua:   rtsp://USERNAME:PASSWORD@IP/cam/realmonitor?channel=1&subtype=0	(use subtype=0 for main stream, substreams are 1,2,3 depending on model and camera configuration)
+#
+
+cameras:
+
+  - name: camera1
+    source_url: "rtsp://USERNAME:PASSWORD@192.168.5.75/stream1"
+    # overlay_file: overlay_mjolko1.png   # default: overlay_<name>.png
+    # fps: 15                             # override global fps for this camera
+    # qp: 24                              # better quality for this specific camera
+
+  - name: camera2
+    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
+
+  - name: camera3
+    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
+
+  - name: camera4
+    source_url: "rtsp://USERNAME:PASSWORD@IP/cam/realmonitor?channel=1&subtype=0"
+
