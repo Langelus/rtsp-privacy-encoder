@@ -103,7 +103,7 @@ max_uptime_hours: 0   # 0 = off; set e.g. 8 for AMD iGPU (NVENC is more stable, 
 cameras:
 
   - name: camera1
-    source_url: "rtsp://USERNAME:PASSWORD@192.168.5.75/stream1"
+    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
     # overlay_file: overlay_mjolko1.png   # default: overlay_<name>.png
     # fps: 15                             # override global fps for this camera
     # qp: 24                              # better quality for this specific camera
