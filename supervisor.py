@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +44,182 @@ ENTRYPOINT  = Path(os.environ.get("ENTRYPOINT", "/entrypoint.sh"))
 
 INITIAL_DELAY = 2
 MAX_DELAY     = 60
+
+# GPU launch gating (see _launch_gate / _gpu_probe_ok).
+# VAAPI on AMD (radeonsi/amdgpu) is the binding constraint: every open VA
+# context — one decode + one encode per output, per camera — becomes a VCN
+# scheduler entity on the kernel driver. Intel iHD and NVENC tolerate dozens
+# open at once; AMD client iGPUs (VCN 1.x/2.x) cap concurrent codec streams
+# much lower, and exceeding the cap does not fail cleanly — it times out
+# GPU jobs and strands ffmpeg in D-state, exactly the hang the entrypoint
+# watchdog recovers from. Staggering launches keeps the live VA-context
+# count inside that budget; _gpu_probe_ok() keeps the supervisor from
+# hammering a GPU that is still recovering from a reset.
+LAUNCH_MIN_GAP     = float(os.environ.get("LAUNCH_MIN_GAP", "10"))
+GPU_PROBE_TIMEOUT  = float(os.environ.get("GPU_PROBE_TIMEOUT", "15"))
+GPU_RECOVERY_DELAY = float(os.environ.get("GPU_RECOVERY_DELAY", "300"))
+GPU_MARKER         = OVERLAY_DIR / ".gpu-sick"   # on the persistent volume
+DSTATE_EXIT_CODE   = 42                          # entrypoint.sh's D-state report
+
+_launch_lock = threading.Lock()
+_last_launch = 0.0
+_gpu_sick    = threading.Event()
+
+
+def _dstate_ffmpeg_pids() -> list[int]:
+    """PIDs of ffmpeg processes currently in uninterruptible sleep (state D).
+
+    A D-state task survives SIGKILL and cannot be reaped (not even by tini);
+    it keeps its DRM fd open against the wedged GPU, poisoning every new VA
+    context until the kernel task finally completes.
+    """
+    pids: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "ffmpeg":
+                    continue
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        if line.split()[1] == "D":
+                            pids.append(pid)
+                        break
+        except OSError:
+            continue
+    return pids
+
+
+def _resolve_render_node() -> Optional[str]:
+    """Resolve the VAAPI render node the same way entrypoint.sh does (auto).
+
+    A renderD node the kernel driver itself is wedged on can hang open() —
+    callers must run this under a timeout.
+    """
+    if os.path.exists("/dev/dri/renderD128"):
+        return "/dev/dri/renderD128"
+    try:
+        names = [
+            n for n in os.listdir("/dev/dri")
+            if n.startswith("renderD") and n[7:].isdigit()
+        ]
+    except OSError:
+        return None
+    if not names:
+        return None
+    names.sort(key=lambda n: int(n[7:]))
+    return f"/dev/dri/{names[0]}"
+
+
+def _gpu_probe_ok(log: logging.Logger) -> bool:
+    """Open the render node and run a tiny VAAPI encode (bounded).
+
+    True  -> the driver answers; safe to launch encoders.
+    False -> the node is missing, open() hangs, or the encode fails — the
+             driver is still recovering (or wedged) even though the
+             container around it is brand new.
+    """
+    node = _resolve_render_node()
+    if node is None:
+        log.warning("gpu probe: no /dev/dri render node visible")
+        return False
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-init_hw_device", f"vaapi=check:{node}",
+             "-f", "lavfi", "-i", "nullsrc=size=320x240:duration=1:rate=2",
+             "-vf", "format=nv12,hwupload",
+             "-c:v", "h264_vaapi", "-f", "null", "-"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=GPU_PROBE_TIMEOUT,
+        )
+        if r.returncode != 0:
+            why = (r.stderr or "").strip().splitlines()
+            log.warning("gpu probe on %s failed: %s",
+                        node, why[-1] if why else f"rc={r.returncode}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.warning("gpu probe on %s timed out after %ss",
+                    node, int(GPU_PROBE_TIMEOUT))
+        return False
+    except Exception as exc:
+        log.warning("gpu probe failed: %s", exc)
+        return False
+
+
+def _launch_gate(name: str, encode: str, stop_event: threading.Event,
+                 log: logging.Logger) -> bool:
+    """Serialize encoder launches and gate them on GPU health.
+
+    - Global minimum spacing between launches: keeps cross-camera bursts
+      (initial start, watchdog-triggered restarts, Apply) from stacking
+      every VA context of every camera onto one AMD VCN at once.
+    - While the GPU is marked sick: VAAPI cameras must pass a probe first;
+      if the probe fails, hold the launch for GPU_RECOVERY_DELAY instead of
+      the normal ≤60s backoff, so we stop feeding customers to a mid-reset
+      driver. x264/nvenc cameras ignore the marker — it tracks VAAPI health.
+
+    Returns False if stop_event fired while waiting (caller must not launch).
+    """
+    global _last_launch
+    while True:
+        if stop_event.is_set():
+            return False
+        if _gpu_sick.is_set() and encode == "vaapi" and not _gpu_probe_ok(log):
+            log.warning("gpu still sick — holding launch of %s for %ds",
+                        name, int(GPU_RECOVERY_DELAY))
+            if stop_event.wait(GPU_RECOVERY_DELAY):
+                return False
+            continue
+        with _launch_lock:
+            wait = LAUNCH_MIN_GAP - (time.monotonic() - _last_launch)
+            if wait > 0:
+                log.info("staggering launch of %s by %.0fs (GPU session budget)",
+                         name, wait)
+                time.sleep(wait)
+            _last_launch = time.monotonic()
+        return True
+
+
+def _gpu_wedge_recreate(pids: list[int], source: str) -> None:
+    """A D-state task is still holding the GPU — recreate the whole container.
+
+    No userspace action can kill a D-state task: it keeps its DRM fd open
+    and the driver cannot complete its GPU reset while it lives. Tini cannot
+    reap it either. The only userspace path with a chance is the container
+    runtime's full cgroup SIGKILL, and we get that by exiting the main
+    process non-zero — Docker's restart policy then tears down and recreates
+    the container. The .gpu-sick marker (persistent volume) makes the NEW
+    container probe the GPU before launching any encoder, because if the
+    hang is kernel-level it outlives the container.
+    """
+    log.error(
+        "%s: ffmpeg pids %s in D-state — GPU driver wedged; exiting to force "
+        "container re-creation (kernel GPU resets may not recover without it)",
+        source, pids,
+    )
+    try:
+        GPU_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        GPU_MARKER.write_text(
+            "gpu wedge detected "
+            f"{datetime.now().isoformat(timespec='seconds')} "
+            f"source={source} pids={pids}\n"
+        )
+    except OSError:
+        pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
 
 # cameras.yaml key → entrypoint.sh environment variable
 _YAML_TO_ENV: dict[str, str] = {
@@ -69,6 +246,7 @@ _YAML_TO_ENV: dict[str, str] = {
     "watchdog_fails":          "WATCHDOG_FAILS",
     "preflight":               "PREFLIGHT",
     "max_uptime_hours":        "MAX_UPTIME_HOURS",
+    "max_uptime_jitter_s":     "MAX_UPTIME_JITTER",
 }
 
 # Mirrors entrypoint.sh defaults so omitting a key from cameras.yaml is safe.
@@ -96,6 +274,7 @@ _ENV_DEFAULTS: dict[str, str] = {
     "WATCHDOG_FAILS":          "3",
     "PREFLIGHT":               "1",
     "MAX_UPTIME_HOURS":        "0",
+    "MAX_UPTIME_JITTER":       "1800",
     "RESTART_DELAY_INITIAL":   "2",
     "RESTART_DELAY_MAX":       "60",
 }
@@ -109,7 +288,8 @@ class CameraManager:
 
     All mutable state (_cam_cfg, _global_cfg, _proc) is protected by _lock.
     The _run() thread holds _lock only for the brief env-build at each loop
-    iteration so concurrent API calls never stall.
+    iteration so concurrent API calls never stall. Launches are additionally
+    serialized GPU-wide by _launch_gate().
     """
 
     def __init__(self, name: str, cam_cfg: dict, global_cfg: dict) -> None:
@@ -231,6 +411,10 @@ class CameraManager:
                 self._stop_event.wait(30)
                 continue
 
+            if not _launch_gate(self.name, env.get("ENCODE", "vaapi"),
+                                self._stop_event, self._log):
+                continue
+
             self._log.info("starting encoder")
             self.state   = "starting"
             started      = time.monotonic()
@@ -255,11 +439,14 @@ class CameraManager:
             self.state = "running"
 
             # Block until entrypoint.sh exits for any reason.
-            # If ffmpeg enters D-state the watchdog inside entrypoint.sh sends
-            # SIGKILL to the bash process (MAIN_PID), which is killable because
-            # only ffmpeg is in D-state. The bash process exits, proc.wait()
-            # returns here, the D-state ffmpeg becomes an orphan reaped by tini
-            # (init: true in compose), and we restart fresh below.
+            # rc == DSTATE_EXIT_CODE (42) means the entrypoint's watchdog (or
+            # its SIGTERM handler) found the ffmpeg it had just SIGKILLed still
+            # alive — i.e. stuck in D-state. A D-state task is NOT reaped by
+            # tini (an uninterruptible task cannot be reaped at all); it keeps
+            # its DRM fd open against the wedged GPU and poisons every new VA
+            # context, so a normal "restart the entrypoint" here would restart
+            # into the same hang. We verify against /proc and escalate via
+            # _gpu_wedge_recreate() (whole-container re-creation) instead.
             rc = proc.wait()
 
             with self._lock:
@@ -267,6 +454,19 @@ class CameraManager:
             self.pid = None
 
             elapsed = time.monotonic() - started
+
+            if rc == DSTATE_EXIT_CODE and not self._stop_event.is_set():
+                d_pids = _dstate_ffmpeg_pids()
+                if d_pids:
+                    _gpu_wedge_recreate(d_pids, f"camera {self.name} (rc=42)")
+                # The task died on its own before we could check — no D-state
+                # survivor, but treat the GPU as suspect and health-gate the
+                # relaunch.
+                self._log.warning(
+                    "camera reported a D-state kill but no D-state task "
+                    "survives — marking GPU sick, relaunch will be probed"
+                )
+                _gpu_sick.set()
 
             if self._stop_event.is_set():
                 break
@@ -622,6 +822,19 @@ def main() -> None:
         sys.exit(1)
 
     OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Cross-recreation recovery: if a previous run left the .gpu-sick marker,
+    # a kernel-level GPU hang may well outlive the container that reported it.
+    # A D-state task that survived container teardown is still visible in
+    # /proc here (init reaps it only when the kernel task completes).
+    if GPU_MARKER.exists():
+        log.warning("gpu-sick marker present (%s) — GPU health-gating "
+                    "enabled until a VAAPI probe passes", GPU_MARKER)
+        _gpu_sick.set()
+    stale = _dstate_ffmpeg_pids()
+    if stale:
+        _gpu_wedge_recreate(stale, "startup scan (stale D-state task from a "
+                                   "previous container generation)")
 
     _supervisor = Supervisor()
 

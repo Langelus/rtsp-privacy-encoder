@@ -131,9 +131,30 @@ VAAPI_DEVICE="${VAAPI_DEVICE:-auto}"
 : "${RESTART_DELAY_INITIAL:=2}"
 : "${RESTART_DELAY_MAX:=60}"
 : "${MAX_UPTIME_HOURS:=0}"  # 0 = off; otherwise restart after one run lasts this long
+# Jitter window for the preventive restart (seconds). A camera's delay past
+# MAX_UPTIME_HOURS*3600 is derived from its name, deterministically spread
+# over this window: cameras started together no longer restart together,
+# which on AMD means never putting every camera's VAAPI sessions back on the
+# GPU in the same second.
+: "${MAX_UPTIME_JITTER:=1800}"
 
 OVERLAY_PATH="/overlays/${OVERLAY_FILE}"
 PID_FILE="/tmp/encoder-ffmpeg.pid"   # lets the watchdog subshell see the live pid
+DSTATE_FLAG="/tmp/encoder-dstate.flag"
+DSTATE_RC=42   # exit code reporting "ffmpeg survived SIGKILL (D-state)" to supervisor.py
+
+# Preventive-restart threshold, jittered per camera (deterministically, from
+# the name — stable across restarts, spread across MAX_UPTIME_JITTER seconds).
+UPTIME_LIMIT=0
+if [ "$MAX_UPTIME_HOURS" -gt 0 ] 2>/dev/null; then
+    name_off=0
+    if [ "$MAX_UPTIME_JITTER" -gt 0 ] 2>/dev/null; then
+        name_off=$(( $(printf '%s' "$CAMERA_NAME" | cksum | cut -d' ' -f1) % MAX_UPTIME_JITTER ))
+    fi
+    UPTIME_LIMIT_OFFSET=$name_off
+    UPTIME_LIMIT=$(( MAX_UPTIME_HOURS * 3600 + UPTIME_LIMIT_OFFSET ))
+fi
+UPTIME_LIMIT_OFFSET=${UPTIME_LIMIT_OFFSET:-0}
 
 # ------------------------------------------------------------------ checks --
 [ -f "$OVERLAY_PATH" ] || { log "ERROR: overlay file missing: $OVERLAY_PATH"; exit 1; }
@@ -765,15 +786,20 @@ watchdog() {
                 kill -KILL "$pid" 2>/dev/null || true
                 # D-state check: a VAAPI/DRM kernel call can hang indefinitely
                 # after hours of use; SIGKILL cannot terminate a D-state process.
-                # The supervisor's 'wait' is also blocked on the same child.
-                # If the process survives SIGKILL, force-restart the entire
-                # container — Docker restarts it and the container teardown
-                # cleans up the orphaned D-state process.
+                # If it survives, this container cannot clean up on its own:
+                # the task keeps its DRM fd open and blocks the driver's GPU
+                # reset, and tini cannot reap an uninterruptible task either.
+                # Report it — marker file + shutdown()'s exit $DSTATE_RC — so
+                # supervisor.py can verify against /proc and exit non-zero:
+                # Docker's restart policy then recreates the container, and
+                # the cgroup-wide SIGKILL during teardown is the strongest
+                # userspace action available against a wedged GPU.
                 sleep 2
                 if kill -0 "$pid" 2>/dev/null; then
-                    log "watchdog: pid $pid survived SIGKILL (D-state GPU driver hang) — force-restarting the container"
-                    kill -KILL "$MAIN_PID" 2>/dev/null || true
-                    exit 1
+                    log "watchdog: pid $pid survived SIGKILL (D-state GPU driver hang) — reporting to supervisor for container re-creation"
+                    printf '%s %s\n' "$(date '+%F %T')" "$pid" > "$DSTATE_FLAG" 2>/dev/null || true
+                    kill -TERM "$MAIN_PID" 2>/dev/null || true
+                    return 0
                 fi
                 fails=0
             else
@@ -801,12 +827,17 @@ shutdown() {
         done
         kill -KILL "$FFMPEG_PID" 2>/dev/null || true
         # Only reap if the process actually died — a D-state process survives
-        # SIGKILL and would block 'wait' forever. Let the container runtime
-        # clean it up instead.
+        # SIGKILL and would block 'wait' forever. In that case report it to
+        # supervisor.py via exit $DSTATE_RC so the whole container gets
+        # re-created: the D-state task keeps holding the GPU, so merely
+        # restarting the entrypoint would restart straight into the hang.
         if ! kill -0 "$FFMPEG_PID" 2>/dev/null; then
             wait "$FFMPEG_PID" 2>/dev/null || true
         else
-            log "shutdown: ffmpeg pid $FFMPEG_PID survived SIGKILL (D-state) — container teardown will clean it up"
+            printf '%s %s\n' "$(date '+%F %T')" "$FFMPEG_PID" > "$DSTATE_FLAG" 2>/dev/null || true
+            log "shutdown: ffmpeg pid $FFMPEG_PID survived SIGKILL (D-state) — reporting to supervisor (exit ${DSTATE_RC}) for container re-creation"
+            log "shutdown complete"
+            exit "$DSTATE_RC"
         fi
     fi
     log "shutdown complete"
@@ -867,8 +898,8 @@ while true; do
     rm -f "$PID_FILE"
     elapsed=$(( $(date +%s) - started ))
 
-    if [ "$MAX_UPTIME_HOURS" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge $(( MAX_UPTIME_HOURS * 3600 )) ]; then
-        log "ran ${elapsed}s — preventive restart (max uptime ${MAX_UPTIME_HOURS}h reached)"
+    if [ "$UPTIME_LIMIT" -gt 0 ] && [ "$elapsed" -ge "$UPTIME_LIMIT" ]; then
+        log "ran ${elapsed}s — preventive restart (uptime limit ${UPTIME_LIMIT}s = ${MAX_UPTIME_HOURS}h + ${UPTIME_LIMIT_OFFSET}s name-derived jitter)"
         delay="$RESTART_DELAY_INITIAL"
         continue
     fi

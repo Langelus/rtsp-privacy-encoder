@@ -1,16 +1,16 @@
 # RTSP Privacy Encoder
 
-This is just a small personal project I created for myself as the NVR I'm using lacks the feature but decided to share it as it seems to be a widespread problem for countries with GDRP regulation prohibiting monitoring of areas considered public places (i.e. pavements etc).
+This is just a small personal project I created for myself as the NVR I'm using lacks the feature but decided to share it as it seems to be a widespread problems for countries with GDRP regulation prohibiting monitoring of areas considered public places (i.e. pavements etc).
 
 The system puts a **privacy mask** over RTSP camera streams and re-encodes them to H.264 — GPU-accelerated with AMD/Intel VAAPI or NVIDIA NVENC. A browser-based editor lets you draw and edit masks over a live camera frame without touching the server.
 
-This has been tested on Intel/AMD through VAAPI encoder as well as Nvidia NVENC on TP-Link and Dahua camerastreams - as there's a infinite amount of combinations for hardware, cameras and settings this is free for you to play around with and no specific support is given.
+This has been tested Intel/AMD through VAAPI encoder as well as Nvidia NVEC with TP-Link and Dahua cameras - as there are a infinite amount of combinations for hardware, cameras and settings this is free for you to play around with and no specific support is given.
 
 Example performance during my testing with 3 streams at 2560x1440 and 1 stream at 4K:
 
-Small low-power Intel N100 mini PC - around 40-50% CPU with a load average around 2
+Intel N100 mini PC:  around 40-50% CPU with a load average around 2
 
-When tests were conducted on more capable systems the load was so small it was indistinguishable. 
+When tested were conducted on more capable systems the load was so small it was undesirable. 
 If figures are way off, take a look so that the hardware offload is working on the system and it's not using CPU to encode/decode.
 
 As the encoder needs a sink to push to - the excellent MediaMTX docker (https://github.com/bluenviron/mediamtx) is in the compose file but you may push to whatever RTSP sink you want/have.
@@ -30,13 +30,13 @@ All cameras are managed from a single `cameras.yaml` file; no rebuild or compose
 - One of:
   - **AMD iGPU / Intel QuickSync** — `/dev/dri` passed to the container (default)
   - **NVIDIA GPU** — [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed, use `Dockerfile.nvidia`
-  - **No GPU** — set `encode: x264` in `cameras.yaml` for software encoding (not recommended)
+  - **No GPU** — set `encode: x264` in `cameras.yaml` for software encoding
 
 ## Quick start
 
 **1. Clone and copy the example config:**
 ```bash
-git clone [<repo-url>](https://github.com/Langelus/rtsp-privacy-encoder)
+git clone <repo-url>
 cd rtsp-privacy-encoder
 cp cameras.yaml.example cameras.yaml
 ```
@@ -79,7 +79,7 @@ rtsp://<host>:8554/<camera-name>_masked_sub   # 640px-wide copy for NVR detect s
 | Download | Save the current mask as a PNG |
 | Save & Apply | Write the mask to disk and restart that camera's encoder |
 
-The canvas is sized to the camera's native resolution. The live preview is fetched from the camera's substream (TP-Link `/stream2`, Dahua `subtype=1`) so the encoder's hold on the main stream is never interrupted. If no substream available it takes the main stream and as a last fallback, you have the ability to edit a uploaded screenshot or clear canvas.
+The canvas is sized to the camera's native resolution. The live preview is fetched from the camera's substream (Uniview `/stream2`, Dahua `subtype=1`) so the encoder's hold on the main stream is never interrupted.
 
 ## cameras.yaml reference
 
@@ -118,20 +118,23 @@ sub_scale: "640:-2"     # W:H (-2 keeps aspect ratio); "off" to disable
 watchdog_interval: 20   # seconds between output-stream probes
 watchdog_fails: 3       # failed probes before force-kill
 max_uptime_hours: 0     # 0 = off; set e.g. 8 for AMD iGPU (prevents VAAPI D-state hangs)
+max_uptime_jitter: 1800 # seconds; preventive restarts are spread across cameras
+                        # (deterministic per-camera offset from the camera name),
+                        # so cameras never restart their GPU sessions simultaneously
 
 # ── RTSP relay (the bundled mediamtx service) ────────────────────────────────
 rtsp_server: "rtsp://rtsp-server:8554"
 
 cameras:
   - name: front_door
-    source_url: "rtsp://user:pass@ipaddress/stream1"
+    source_url: "rtsp://user:pass@192.168.1.10/stream1"
     # Any global setting can be overridden here, e.g.:
     # qp: 24
     # max_uptime_hours: 8
 
   # Dahua cameras use subtype=0 for the main stream
   - name: backyard
-    source_url: "rtsp://user:pass@ipaddress/cam/realmonitor?channel=1&subtype=0"
+    source_url: "rtsp://user:pass@192.168.1.11/cam/realmonitor?channel=1&subtype=0"
 ```
 
 Hot-reload: the supervisor picks up any change to `cameras.yaml` within 5 seconds — no restart needed to add or remove a camera.
@@ -149,6 +152,8 @@ hwaccel: auto
 ```
 
 Set `max_uptime_hours: 8` on AMD iGPU to prevent rare kernel-level VAAPI hangs after many hours of continuous use.
+
+AMD iGPUs cap the number of concurrent hardware codec sessions far below Intel/NVIDIA — each camera holds one VAAPI decode plus one encode per output (main + sub). The supervisor therefore staggers encoder launches (`LAUNCH_MIN_GAP`, default 10 s, GPU-wide) so cameras never stack their sessions on the GPU at the same moment. If the AMD driver hangs in-kernel (ffmpeg stuck in uninterruptible `D` state, surviving SIGKILL), the supervisor detects it, marks the GPU unhealthy, lets Docker re-create the container, and health-probes the render node before launching anything in the new container — tuning knobs are `LAUNCH_MIN_GAP`, `GPU_PROBE_TIMEOUT` and `GPU_RECOVERY_DELAY` (see table below). As further session-budget levers on small AMD iGPUs: `sub_scale: off` and `hwaccel: none` each remove sessions per camera.
 
 ### NVIDIA NVENC
 
@@ -204,13 +209,18 @@ cameras:
 | `ADMIN_TOKEN` | empty | If set, all `/api/*` calls require `X-Admin-Token: <token>` header |
 | `ADMIN_PORT` | `8090` | Web UI port (set in `docker-compose.yml`) |
 | `RTSP_PORT` | `8554` | RTSP relay port (set in `docker-compose.yml`) |
+| `LAUNCH_MIN_GAP` | `10` | Min seconds between encoder launches, GPU-wide (session-stagger for AMD) |
+| `GPU_PROBE_TIMEOUT` | `15` | Seconds the VAAPI health probe may take before the GPU counts as unhealthy |
+| `GPU_RECOVERY_DELAY` | `300` | Seconds to hold encoder launches while the GPU is unhealthy |
 
-Set `ADMIN_TOKEN` in `docker-compose.yml` (or a `.env` file) to secure the webinterface (optional).
+Per-camera in `cameras.yaml`: `max_uptime_hours`, `max_uptime_jitter`.
+
+Set `ADMIN_TOKEN` in `docker-compose.yml` (or a `.env` file) if the editor port is reachable outside a trusted LAN.
 
 ## Security notes
 
 - `/api/health` is always open even when a token is set (used by the container's own healthcheck).
-- This docker is NOT intended to be exposed to the internet, it's only meant to be running locally alongside the NVR system in a controlled network.
+- This docker is NOT intended to be exposed to the internet, it's only meant to be running locally alongside the NVR system.
 
 ## License
 

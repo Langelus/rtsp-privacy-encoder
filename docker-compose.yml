@@ -63,6 +63,11 @@ services:
       - "${ADMIN_PORT:-8090}:8090"          # web UI + REST API
     environment:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}         # optional; if set, /api/* requires X-Admin-Token header
+      # GPU launch gating (defaults shown) — most relevant on AMD iGPUs,
+      # where every VAAPI session is a kernel codec-stream on one shared GPU:
+      # LAUNCH_MIN_GAP: "10"                # min s between encoder launches, GPU-wide
+      # GPU_PROBE_TIMEOUT: "15"             # s allowed for the VAAPI health probe
+      # GPU_RECOVERY_DELAY: "300"           # s to hold launches while the GPU is unhealthy
     logging:
       driver: json-file
       options: { max-size: "20m", max-file: "5" }

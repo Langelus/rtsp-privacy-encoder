@@ -8,7 +8,7 @@
 #   - changing encoder settings (fps, qp, etc.) takes effect on next restart
 #     (use "Save & Apply" in the web UI, or docker compose restart rtsp-encoder)
 #
-# Credentials live ONLY here
+# Credentials live ONLY here — never in docker-compose.yml or .env.
 # ============================================================================
 
 
@@ -83,37 +83,39 @@ preflight: 1   # 1 = run a 1s test-encode at startup to catch driver issues earl
 
 # ── Preventive restart ───────────────────────────────────────────────────────
 # AMD VAAPI iGPU drivers (radeonsi) can develop an uninterruptible kernel hang
-# (D-state) after many hours of continuous use if unlucky. The watchdog detects and
-# recovers from it, but a periodic preventive restart avoids the outage.
+# (D-state) after many hours of continuous use. The watchdog detects and
+# recovers from it (the whole container is re-created with the GPU
+# health-gated before relaunch), but a periodic preventive restart avoids the
+# outage in the first place.
 # Recommended: 8–12 for AMD iGPU; 0 (off) for Intel iHD which is more stable.
 max_uptime_hours: 0   # 0 = off; set e.g. 8 for AMD iGPU (NVENC is more stable, 0 is fine)
+max_uptime_jitter: 1800  # s; the restart time past max_uptime_hours is offset per camera
+                         # (deterministically, from the camera name) so cameras never
+                         # put all their GPU sessions back down at the same moment
 
 
 # ── Cameras ──────────────────────────────────────────────────────────────────
 # Required per camera: name, source_url
 # Optional per camera: overlay_file, output_url, sub_output_url, and any of the
 # global settings above to override them for just that camera.
-#
-# Examples, please susbstitute credentials and IPs:
-# 
-#  TP-Link: rtsp://USERNAME:PASSWORD@IP/stream1 			(use stream1 - low-res at "stream2")
-#  Dahua:   rtsp://USERNAME:PASSWORD@IP/cam/realmonitor?channel=1&subtype=0	(use subtype=0 for main stream, substreams are 1,2,3 depending on model and camera configuration)
-#
-
 cameras:
 
-  - name: camera1
-    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
+  - name: mjolko1
+    source_url: "rtsp://USERNAME:PASSWORD@192.168.5.75/stream1"
     # overlay_file: overlay_mjolko1.png   # default: overlay_<name>.png
     # fps: 15                             # override global fps for this camera
     # qp: 24                              # better quality for this specific camera
 
-  - name: camera2
-    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
+  - name: mjolko2
+    source_url: "rtsp://USERNAME:PASSWORD@192.168.5.74/stream1"
 
-  - name: camera3
-    source_url: "rtsp://USERNAME:PASSWORD@IP/stream1"
+  - name: mjolko3
+    source_url: "rtsp://USERNAME:PASSWORD@192.168.5.78/stream1"
 
-  - name: camera4
-    source_url: "rtsp://USERNAME:PASSWORD@IP/cam/realmonitor?channel=1&subtype=0"
-
+  # Dahua camera — note: use subtype=0 (main stream), not subtype=1.
+  # The editor's /frame preview auto-derives subtype=1 for the parallel-safe
+  # preview; subtype=0 is what the encoder needs (full resolution, with audio).
+  - name: mjolko4
+    source_url: "rtsp://USERNAME:PASSWORD@HOST/cam/realmonitor?channel=1&subtype=0"
+    # This camera was 3840×2160 HEVC — GPU decode especially important here.
+    # hwaccel: vaapi    # force GPU decode; exit if unsupported
