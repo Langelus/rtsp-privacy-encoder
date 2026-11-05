@@ -19,7 +19,14 @@
   @media (max-width: 950px) { main { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .stage-wrap { padding: 0; overflow: hidden; }
-  .stage { position: relative; width: 100%; background: #000; touch-action: none; }
+  .stage { position: relative; width: 100%; background: repeating-conic-gradient(#2a2a2a 0% 25%, #222 0% 50%) 0 0 / 20px 20px; touch-action: none; }
+  #no-frame { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    position: absolute; inset: 0; z-index: 2; padding: 28px; text-align: center;
+    background: rgba(20,23,28,.88); }
+  #no-frame[hidden] { display: none; }
+  #no-frame p { color: var(--muted); font-size: 13px; max-width: 320px; margin: 0; line-height: 1.55; }
+  #no-frame .nf-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  input[type=number] { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-size: 13px; width: 72px; text-align: center; }
   .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   #mask { cursor: crosshair; }
   #mask.hidecross { cursor: none; }   /* brush/line/eraser: the preview circle IS the pointer */
@@ -67,6 +74,20 @@
         <canvas id="bg"></canvas>
         <canvas id="mask"></canvas>
         <div id="brushcursor" hidden></div>
+        <div id="no-frame" hidden>
+          <p>No live preview available — the camera may not support a second concurrent stream while the encoder is running.</p>
+          <div class="nf-row">
+            <label>Resolution</label>
+            <input type="number" id="nf-w" value="1920" min="1" max="8192">
+            <span style="color:var(--muted)">×</span>
+            <input type="number" id="nf-h" value="1080" min="1" max="8192">
+          </div>
+          <div class="nf-row">
+            <input type="file" id="nf-upload" accept="image/*" style="display:none">
+            <button id="nf-upload-btn">Upload screenshot</button>
+            <button id="nf-blank-btn" class="primary">Use blank canvas</button>
+          </div>
+        </div>
       </div>
     </div>
     <div id="status"><span class="dot"></span><span id="statustext">loading…</span></div>
@@ -371,11 +392,23 @@ async function grabFrameBitmap(cam, timeoutMs) {
   } finally { clearTimeout(t); }
 }
 
+async function loadOverlay(cam) {
+  if (!cam.has_overlay) return;
+  try {
+    const res = await api(`/api/cameras/${cam.name}/overlay`);
+    const img = new Image();
+    img.src = URL.createObjectURL(await res.blob());
+    await img.decode();
+    drawOverlaySource(img);
+  } catch (e) { status("Note: " + e.message); }
+}
+
 async function selectCamera(cam) {
   state.cam = cam;
   state.undo = [];
   state.overlaySrc = null;
   $("#caminfo").textContent = "";
+  $("#no-frame").hidden = true;
   status("Loading camera…");
   mctx.clearRect(0, 0, mask.width, mask.height);
   bg.getContext("2d").clearRect(0, 0, bg.width, bg.height);
@@ -390,35 +423,33 @@ async function selectCamera(cam) {
     const s = await api(`/api/cameras/${cam.name}/size`, { signal: abortAfter(20000) });
     W = s.width; H = s.height;
   } catch (e) {}
-  // Live preview: the server prefers the camera's substream (it accepts
-  // concurrent sessions, so it works while the encoder streams the main).
+  // Live preview: the server tries the camera's substream first (accepts
+  // concurrent sessions), then falls back to the main stream.
   try { bmp = await grabFrameBitmap(cam, 9000); } catch (e) {}
+
   if (!W && bmp) { W = bmp.width; H = bmp.height; }
-  if (!W && cam.overlay_px) {
-    W = cam.overlay_px.w; H = cam.overlay_px.h;
-    $("#caminfo").textContent = `no live stream — canvas from saved mask ${W}×${H}`;
-  }
-  if (!W) { W = 1920; H = 1080; $("#caminfo").textContent = "frame unavailable — assuming 1920×1080"; }
+  if (!W && cam.overlay_px) { W = cam.overlay_px.w; H = cam.overlay_px.h; }
+  if (!W) { W = 1920; H = 1080; }
   sizeCanvas(W, H);
+
   if (bmp) {
     const bctx = bg.getContext("2d");
-    bctx.drawImage(bmp, 0, 0, W, H);   // preview scaled to the main-size canvas
+    bctx.drawImage(bmp, 0, 0, W, H);
     if (!$("#caminfo").textContent) $("#caminfo").textContent =
       (bmp.width === W && bmp.height === H)
         ? `live frame ${W}×${H}`
         : `preview ${bmp.width}×${bmp.height} → canvas ${W}×${H}`;
+    await loadOverlay(cam);
+    status("Ready — draw the mask, then Save & Apply");
+  } else {
+    // No frame available: load any existing mask, then show the fallback panel
+    // so the user can provide a background or confirm/correct the resolution.
+    await loadOverlay(cam);
+    $("#nf-w").value = W;
+    $("#nf-h").value = H;
+    $("#no-frame").hidden = false;
+    status("No live preview — upload a screenshot or use a blank canvas", "warn");
   }
-
-  if (cam.has_overlay) {
-    try {
-      const res = await api(`/api/cameras/${cam.name}/overlay`);
-      const img = new Image();
-      img.src = URL.createObjectURL(await res.blob());
-      await img.decode();
-      drawOverlaySource(img);
-    } catch (e) { status("Note: " + e.message); }
-  }
-  status("Ready — draw the mask, then Save & Apply");
 }
 
 async function saveAndApply() {
@@ -443,6 +474,40 @@ async function saveAndApply() {
     btn.disabled = false;
   }
 }
+// No-frame fallback panel
+$("#nf-upload-btn").addEventListener("click", () => $("#nf-upload").click());
+$("#nf-upload").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  e.target.value = "";
+  try {
+    const bmp = await createImageBitmap(f);
+    // Use the image's own dimensions as the authoritative resolution.
+    const W = bmp.width, H = bmp.height;
+    $("#nf-w").value = W; $("#nf-h").value = H;
+    sizeCanvas(W, H);
+    bg.getContext("2d").drawImage(bmp, 0, 0, W, H);
+    await loadOverlay(state.cam);
+    $("#no-frame").hidden = true;
+    $("#caminfo").textContent = `screenshot ${W}×${H}`;
+    status("Screenshot loaded — draw the mask, then Save & Apply", "ok");
+  } catch (err) {
+    status("Could not load screenshot: " + err.message, "err");
+  }
+});
+$("#nf-blank-btn").addEventListener("click", async () => {
+  const W = Math.max(1, Math.min(8192, +$("#nf-w").value || 1920));
+  const H = Math.max(1, Math.min(8192, +$("#nf-h").value || 1080));
+  sizeCanvas(W, H);
+  const bctx = bg.getContext("2d");
+  bctx.fillStyle = "#555";
+  bctx.fillRect(0, 0, W, H);
+  await loadOverlay(state.cam);
+  $("#no-frame").hidden = true;
+  $("#caminfo").textContent = `blank canvas ${W}×${H}`;
+  status("Ready — draw the mask, then Save & Apply");
+});
+
 $("#save").addEventListener("click", saveAndApply);
 
 $("#download").addEventListener("click", () => {
